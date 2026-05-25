@@ -2,8 +2,8 @@ import requests
 import re
 import html
 import os
+import sys
 from docx import Document
-from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -163,6 +163,40 @@ def free_ollama_memory(ollama_url=OLLAMA_URL, model=MODEL_CONTEXT):
     except Exception as e:
         print(f" -> Error freeing memory: {e}")
 
+
+class TranslationProgress:
+    """Simple terminal progress bar for translation completion."""
+    def __init__(self, total_items, bar_width=32):
+        self.total_items = max(0, total_items)
+        self.current_items = 0
+        self.bar_width = bar_width
+
+    def render(self):
+        if self.total_items <= 0:
+            return
+
+        ratio = min(1.0, self.current_items / self.total_items)
+        filled = int(self.bar_width * ratio)
+        percent = int(ratio * 100)
+        bar = "#" * filled + "-" * (self.bar_width - filled)
+        sys.stdout.write(
+            f"\r   Progress: [{bar}] {self.current_items}/{self.total_items} ({percent:3d}%)"
+        )
+        sys.stdout.flush()
+
+    def advance(self, step=1):
+        if self.total_items <= 0:
+            return
+        self.current_items = min(self.total_items, self.current_items + step)
+        self.render()
+
+    def finish(self):
+        if self.total_items <= 0:
+            return
+        self.current_items = self.total_items
+        self.render()
+        print()
+
 # ---------------------------------------------------------------------------
 # 2. TAG MANIPULATION AND PYTHON-DOCX LOGIC
 # ---------------------------------------------------------------------------
@@ -186,8 +220,103 @@ def paragraph_to_tags(paragraph):
         tagged_text += text
     return tagged_text
 
-def apply_tagged_translation(paragraph, translated_text):
-    """Parses the translated text, filters invalid tags, and cleanly rebuilds the runs."""
+
+def is_translatable_text(tagged_text):
+    """Determine whether a tagged text should be sent for translation."""
+    return bool(tagged_text and tagged_text.strip() and re.search(r'[a-zA-Z]', tagged_text))
+
+def snapshot_run_style(run):
+    """Capture a run style so it can be reapplied after translation."""
+    style = {
+        "bold": run.bold,
+        "italic": run.italic,
+        "underline": run.underline,
+        "strike": run.font.strike,
+        "name": run.font.name,
+        "size": run.font.size,
+        "highlight_color": run.font.highlight_color,
+        "style": run.style,
+        "color_rgb": None,
+        "color_theme": None,
+    }
+
+    color = run.font.color
+    if color is not None:
+        try:
+            style["color_rgb"] = color.rgb
+        except Exception:
+            style["color_rgb"] = None
+
+        if style["color_rgb"] is None:
+            try:
+                style["color_theme"] = color.theme_color
+            except Exception:
+                style["color_theme"] = None
+
+    return style
+
+
+def apply_style_snapshot(style, run):
+    """Reapply a style snapshot to a run."""
+    run.bold = style["bold"]
+    run.italic = style["italic"]
+    run.underline = style["underline"]
+    run.font.strike = style["strike"]
+    run.font.name = style["name"]
+
+    if style["size"] is not None:
+        run.font.size = style["size"]
+
+    if style["highlight_color"] is not None:
+        run.font.highlight_color = style["highlight_color"]
+
+    if style["style"] is not None:
+        run.style = style["style"]
+
+    if style["color_rgb"] is not None:
+        try:
+            run.font.color.rgb = style["color_rgb"]
+            return
+        except Exception:
+            pass
+
+    if style["color_theme"] is not None:
+        try:
+            run.font.color.theme_color = style["color_theme"]
+        except Exception:
+            pass
+
+
+def build_paragraph_style_plan(paragraph):
+    """Build a style plan from original runs based on text lengths."""
+    style_plan = []
+    for run in paragraph.runs:
+        run_text = run.text or ""
+        if not run_text:
+            continue
+        style_plan.append({
+            "length": len(run_text),
+            "style": snapshot_run_style(run),
+        })
+
+    if not style_plan and paragraph.runs:
+        style_plan.append({
+            "length": 1,
+            "style": snapshot_run_style(paragraph.runs[0]),
+        })
+
+    return style_plan
+
+
+def apply_tagged_translation_preserving_style(paragraph, translated_text):
+    """Parses translated text and rebuilds runs while preserving original run styles."""
+    if not paragraph.runs:
+        return
+
+    style_plan = build_paragraph_style_plan(paragraph)
+    if not style_plan:
+        return
+
     # Clean up potential markdown blocks hallucinated by the LLM
     translated_text = re.sub(r'```[a-zA-Z0-9]*', '', translated_text).strip()
     
@@ -204,6 +333,9 @@ def apply_tagged_translation(paragraph, translated_text):
     italic_level = 0
     underline_level = 0
     strike_level = 0
+
+    style_index = 0
+    style_remaining = style_plan[style_index]["length"]
     
     for token in tokens:
         if not token:
@@ -238,13 +370,204 @@ def apply_tagged_translation(paragraph, translated_text):
         else:
             # It's raw text: convert HTML entities (e.g., &amp; -> &)
             clean_text = html.unescape(token)
-            
-            if clean_text:
-                run = paragraph.add_run(clean_text)
-                if bold_level > 0: run.bold = True
-                if italic_level > 0: run.italic = True
-                if underline_level > 0: run.underline = True
-                if strike_level > 0: run.font.strike = True
+
+            while clean_text:
+                if style_remaining <= 0 and style_index < len(style_plan) - 1:
+                    style_index += 1
+                    style_remaining = style_plan[style_index]["length"]
+
+                # Keep last style for overflow when translation is longer than source.
+                if style_remaining <= 0:
+                    style_remaining = len(clean_text)
+
+                chunk_len = min(len(clean_text), style_remaining)
+                text_chunk = clean_text[:chunk_len]
+                clean_text = clean_text[chunk_len:]
+
+                run = paragraph.add_run(text_chunk)
+                apply_style_snapshot(style_plan[style_index]["style"], run)
+
+                # Override preserved run style only if translated tags request emphasis.
+                if bold_level > 0:
+                    run.bold = True
+                if italic_level > 0:
+                    run.italic = True
+                if underline_level > 0:
+                    run.underline = True
+                if strike_level > 0:
+                    run.font.strike = True
+
+                style_remaining -= chunk_len
+
+
+def iter_header_footer_parts(doc):
+    """Yield each distinct header/footer part once across all sections."""
+    seen_partnames = set()
+    for section in doc.sections:
+        candidates = [
+            section.header,
+            section.first_page_header,
+            section.even_page_header,
+            section.footer,
+            section.first_page_footer,
+            section.even_page_footer,
+        ]
+        for part in candidates:
+            try:
+                partname = str(part.part.partname)
+            except Exception:
+                partname = None
+
+            if partname and partname in seen_partnames:
+                continue
+            if partname:
+                seen_partnames.add(partname)
+
+            yield part
+
+
+def extract_text_from_story_part(story_part, texts):
+    """Collect paragraphs, tables, and text boxes text from a body/header/footer part."""
+    for p in story_part.paragraphs:
+        if p.text.strip():
+            texts.append(p.text)
+
+    for table in story_part.tables:
+        extract_text_from_table(table, texts)
+
+    for txbx in story_part._element.xpath('.//w:txbxContent'):
+        for p_element in txbx.xpath('.//w:p'):
+            p = Paragraph(p_element, story_part)
+            if p.text.strip():
+                texts.append(p.text)
+
+
+def extract_text_from_table(table, texts):
+    """Recursively collect text from a table and nested tables."""
+    for row in table.rows:
+        for cell in row.cells:
+            for p in cell.paragraphs:
+                if p.text.strip():
+                    texts.append(p.text)
+            for nested_table in cell.tables:
+                extract_text_from_table(nested_table, texts)
+
+
+def count_translatable_items_in_table(table):
+    """Count translatable paragraph items recursively in a table."""
+    count = 0
+    for row in table.rows:
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                tagged_text = paragraph_to_tags(paragraph)
+                if is_translatable_text(tagged_text):
+                    count += 1
+            for nested_table in cell.tables:
+                count += count_translatable_items_in_table(nested_table)
+    return count
+
+
+def count_translatable_items_in_story_part(story_part):
+    """Count all translatable paragraph items in a body/header/footer part."""
+    count = 0
+
+    for paragraph in story_part.paragraphs:
+        tagged_text = paragraph_to_tags(paragraph)
+        if is_translatable_text(tagged_text):
+            count += 1
+
+    for table in story_part.tables:
+        count += count_translatable_items_in_table(table)
+
+    for txbx in story_part._element.xpath('.//w:txbxContent'):
+        for p_element in txbx.xpath('.//w:p'):
+            paragraph = Paragraph(p_element, story_part)
+            tagged_text = paragraph_to_tags(paragraph)
+            if is_translatable_text(tagged_text):
+                count += 1
+
+    return count
+
+
+def translate_paragraph_if_needed(paragraph, context, ollama_url, model_context, source_language, target_language, progress=None):
+    """Translate one paragraph when text content requires translation."""
+    tagged_text = paragraph_to_tags(paragraph)
+    if is_translatable_text(tagged_text):
+        translation = translate_text_with_context(
+            tagged_text,
+            context,
+            ollama_url=ollama_url,
+            model_context=model_context,
+            source_language=source_language,
+            target_language=target_language,
+        )
+        apply_tagged_translation_preserving_style(paragraph, translation)
+        if progress is not None:
+            progress.advance()
+
+
+def translate_table(table, context, ollama_url, model_context, source_language, target_language, progress=None):
+    """Translate a table recursively, including nested tables."""
+    for row in table.rows:
+        for cell in row.cells:
+            for paragraph in cell.paragraphs:
+                translate_paragraph_if_needed(
+                    paragraph,
+                    context,
+                    ollama_url,
+                    model_context,
+                    source_language,
+                    target_language,
+                    progress=progress,
+                )
+            for nested_table in cell.tables:
+                translate_table(
+                    nested_table,
+                    context,
+                    ollama_url,
+                    model_context,
+                    source_language,
+                    target_language,
+                    progress=progress,
+                )
+
+
+def translate_story_part(story_part, context, ollama_url, model_context, source_language, target_language, progress=None):
+    """Translate all translatable text in a body/header/footer part."""
+    for paragraph in story_part.paragraphs:
+        translate_paragraph_if_needed(
+            paragraph,
+            context,
+            ollama_url,
+            model_context,
+            source_language,
+            target_language,
+            progress=progress,
+        )
+
+    for table in story_part.tables:
+        translate_table(
+            table,
+            context,
+            ollama_url,
+            model_context,
+            source_language,
+            target_language,
+            progress=progress,
+        )
+
+    for txbx in story_part._element.xpath('.//w:txbxContent'):
+        for p_element in txbx.xpath('.//w:p'):
+            paragraph = Paragraph(p_element, story_part)
+            translate_paragraph_if_needed(
+                paragraph,
+                context,
+                ollama_url,
+                model_context,
+                source_language,
+                target_language,
+                progress=progress,
+            )
 
 # ---------------------------------------------------------------------------
 # 3. MAIN PROCESS
@@ -254,18 +577,13 @@ def extract_all_text(input_path):
     """Scans the document a first time to extract all raw text."""
     doc = Document(input_path)
     texts = []
-    # Limit the extracted size to avoid overloading AI model's context window
-    for p in doc.paragraphs:
-        if p.text.strip(): texts.append(p.text)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    if p.text.strip(): texts.append(p.text)
-    for txbx in doc.element.xpath('//w:txbxContent'):
-        for p_element in txbx.xpath('.//w:p'):
-            p = Paragraph(p_element, doc._body)
-            if p.text.strip(): texts.append(p.text)
+
+    # Body text (paragraphs, tables, text boxes)
+    extract_text_from_story_part(doc, texts)
+
+    # Headers and footers across sections
+    for story_part in iter_header_footer_parts(doc):
+        extract_text_from_story_part(story_part, texts)
             
     # Returns the first 8000 characters to give a general idea without crashing the API
     return "\n".join(texts)[:8000]
@@ -307,32 +625,43 @@ def translate_full_docx(input_path, output_path, ollama_url, model_context, sour
     except Exception as e:
         print(f"Error while opening input document: {e}")
         return False
-    
-    print("3. Translating paragraphs...")
-    for paragraph in doc.paragraphs:
-        tagged_text = paragraph_to_tags(paragraph)
-        if tagged_text.strip() and re.search(r'[a-zA-Z]', tagged_text):
-            translation = translate_text_with_context(tagged_text, context, ollama_url=ollama_url, model_context=model_context, source_language=source_language, target_language=target_language)
-            apply_tagged_translation(paragraph, translation)
-            
-    print("4. Translating tables...")
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for paragraph in cell.paragraphs:
-                    tagged_text = paragraph_to_tags(paragraph)
-                    if tagged_text.strip() and re.search(r'[a-zA-Z]', tagged_text):
-                        translation = translate_text_with_context(tagged_text, context, ollama_url=ollama_url, model_context=model_context, source_language=source_language, target_language=target_language)
-                        apply_tagged_translation(paragraph, translation)
 
-    print("5. Translating text boxes...")
-    for txbx in doc.element.xpath('//w:txbxContent'):
-        for p_element in txbx.xpath('.//w:p'):
-            paragraph = Paragraph(p_element, doc._body)
-            tagged_text = paragraph_to_tags(paragraph)
-            if tagged_text.strip() and re.search(r'[a-zA-Z]', tagged_text):
-                translation = translate_text_with_context(tagged_text, context, ollama_url=ollama_url, model_context=model_context, source_language=source_language, target_language=target_language)
-                apply_tagged_translation(paragraph, translation)
+    print("3. Counting translatable items...")
+    total_items = count_translatable_items_in_story_part(doc)
+    for story_part in iter_header_footer_parts(doc):
+        total_items += count_translatable_items_in_story_part(story_part)
+
+    print(f"   Items to translate: {total_items}")
+    progress = TranslationProgress(total_items)
+    if total_items > 0:
+        progress.render()
+    else:
+        print("   No translatable items found. The document will be saved unchanged.")
+    
+    print("\n4. Translating body content...")
+    translate_story_part(
+        doc,
+        context,
+        ollama_url,
+        model_context,
+        source_language,
+        target_language,
+        progress=progress,
+    )
+
+    print("5. Translating headers and footers...")
+    for story_part in iter_header_footer_parts(doc):
+        translate_story_part(
+            story_part,
+            context,
+            ollama_url,
+            model_context,
+            source_language,
+            target_language,
+            progress=progress,
+        )
+
+    progress.finish()
 
     print("6. Saving the translated document...")
     try:
