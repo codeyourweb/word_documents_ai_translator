@@ -1,10 +1,10 @@
-# Word Documents AI Translator
+# Microsoft Word documents AI translator
 
 This project is an experimentation to translate large Word documents (`.docx`) while preserving style and structure, using a local AI model through Ollama.
 
 It is designed to keep formatting elements such as bold, italic, underline, strikethrough, tables, and text boxes as intact as possible during translation.
 
-## Why This Project
+## Why this project
 
 Translating long `.docx` files often breaks formatting or requires cloud services.
 This script focuses on:
@@ -13,13 +13,13 @@ This script focuses on:
 - Preserving document structure and styling.
 - Using a local LLM workflow (no mandatory external translation API).
 
-## Default Model
+## Default model
 
 The default model is **`qwen2.5:7b`** (Qwen 2.5), selected as the best balance between power and lightness for this use case.
 
 You can change the model in `word_document_translator.py` by editing `MODEL_CONTEXT` constant
 
-## Current Defaults
+## Current defaults
 
 In `word_document_translator.py`, default values are:
 
@@ -27,7 +27,9 @@ In `word_document_translator.py`, default values are:
 - Target language: `french`
 - Input file: `original_document.docx`
 - Output file: `translated_document.docx`
-- Ollama endpoint: `http://localhost:11434/api/generate`
+- Ollama endpoint: `http://localhost:11434`
+
+Replace the variables with your desired values in the script. Source and target language support depends only on the AI model used. 
 
 ## Requirements
 
@@ -59,13 +61,13 @@ python word_document_translator.py
 
 If successful, the translated document will be written to `translated_document.docx` (or your configured output path).
 
-## Notes and Limitations
+## Notes and limitations
 
 - This is an experimental project and translation quality depends on model behavior.
 - Very complex formatting can still require manual review after translation.
 - Performance and quality vary with document length and model hardware constraints.
 
-## Maintenance Policy
+## Maintenance policy
 
 While this code is shared publicly, it is an in-house development for personal use and will not necessarily be maintained.
 

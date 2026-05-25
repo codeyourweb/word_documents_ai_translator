@@ -6,7 +6,7 @@ import sys
 from docx import Document
 from docx.text.paragraph import Paragraph
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_URL = "http://localhost:11434"
 MODEL_CONTEXT = "qwen2.5:7b"
 
 LANGUAGE_SOURCE = "english"
@@ -29,12 +29,18 @@ class OllamaUnavailableError(Exception):
 class OllamaQueryError(Exception):
     """Raised when a request to Ollama fails (timeout, HTTP error, etc.)."""
 
+def build_ollama_endpoint(ollama_url, endpoint):
+    """Build a stable Ollama endpoint from a base URL or legacy full endpoint URL."""
+    base_url = ollama_url.rstrip("/")
+    for suffix in ("/api/generate", "/api/tags"):
+        if base_url.endswith(suffix):
+            base_url = base_url[:-len(suffix)]
+            break
+    return f"{base_url}{endpoint}"
 
 def check_ollama_reachable(ollama_url=OLLAMA_URL, timeout=5):
     """Checks if the Ollama service is reachable before translation starts."""
-    # OLLAMA_URL usually ends with /api/generate; /api/tags is a lightweight health endpoint.
-    base_url = ollama_url.replace("/api/generate", "")
-    health_url = f"{base_url}/api/tags"
+    health_url = build_ollama_endpoint(ollama_url, "/api/tags")
     try:
         response = requests.get(health_url, timeout=timeout)
         response.raise_for_status()
@@ -50,7 +56,7 @@ def check_ollama_reachable(ollama_url=OLLAMA_URL, timeout=5):
 
 def generate_document_context(full_text, ollama_url=OLLAMA_URL, model_context=MODEL_CONTEXT, source_language=LANGUAGE_SOURCE, target_language=LANGUAGE_TARGET):
     """Analyzes the entire document to create a universal context summary."""
-    url = ollama_url
+    url = build_ollama_endpoint(ollama_url, "/api/generate")
     prompt = (
         f"Analyze the following text extracted from a document. "
         f"Generate a brief summary (2-3 sentences max) describing only: "
@@ -87,7 +93,7 @@ def translate_text_with_context(tagged_text, context, ollama_url=OLLAMA_URL, mod
     if not re.search(r'[a-zA-Z]', tagged_text):
         return tagged_text
 
-    url = ollama_url
+    url = build_ollama_endpoint(ollama_url, "/api/generate")
     
     # Restructured prompt to "force" direct translation start
     prompt = f"""You are an expert translator.
@@ -95,10 +101,12 @@ def translate_text_with_context(tagged_text, context, ollama_url=OLLAMA_URL, mod
 
     ABSOLUTE AND IMPERATIVE RULES:
     1. Translate the ENTIRE text FROM {source_language} into {target_language}. Leave absolutely NO word, part of a sentence, or start of a sentence in {source_language}. EVERYTHING must be translated.
-    2. Pay close attention to quotes (" or '): you must translate everything before, inside, and after the quotes.
-    3. Keep EXACTLY the position of HTML tags (<...>) without translating their code.
-    4. NEVER copy the source text in {source_language} into your response.
-    5. FORMAL PROHIBITION to add introductory or polite words.
+    2. NEVER SPECIFY that the text is a "Direct {target_language} translation" or a "Literal {target_language} translation" if the text is very generic or lacks specific context.
+    3. NEVER add comments or preambles for text that is too small or empty to be translated. Just translate it as is or leave it empty.
+    4. Pay close attention to quotes (" or '): you must translate everything before, inside, and after the quotes.
+    5. Keep EXACTLY the position of HTML tags (<...>) without translating their code.
+    6. NEVER copy the source text in {source_language} into your response.
+    7. FORMAL PROHIBITION to add introductory or polite words.    
 
     Original text:
     {tagged_text}
@@ -158,7 +166,7 @@ def free_ollama_memory(ollama_url=OLLAMA_URL, model=MODEL_CONTEXT):
         "keep_alive": 0
     }
     try:
-        requests.post(ollama_url, json=payload)
+        requests.post(build_ollama_endpoint(ollama_url, "/api/generate"), json=payload)
         print(f" -> Memory successfully freed for the model {model}.")
     except Exception as e:
         print(f" -> Error freeing memory: {e}")
