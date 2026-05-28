@@ -1,3 +1,4 @@
+import argparse
 import requests
 import re
 import html
@@ -9,10 +10,10 @@ from docx.text.paragraph import Paragraph
 OLLAMA_URL = "http://localhost:11434"
 MODEL_CONTEXT = "qwen2.5:7b"
 
-LANGUAGE_SOURCE = "english"
-LANGUAGE_TARGET = "french"
+LANGUAGE_SOURCE = "french"
+LANGUAGE_TARGET = "english"
 
-REQUEST_TIMEOUT_SECONDS = 60
+REQUEST_TIMEOUT_SECONDS = 120
 
 INPUT_DOCX_PATH = "original_document.docx"
 OUTPUT_DOCX_PATH = "translated_document.docx"
@@ -87,26 +88,56 @@ def generate_document_context(full_text, ollama_url=OLLAMA_URL, model_context=MO
         print(f"Error during context generation (invalid JSON response): {e}")
         return "No specific context."
 
-def translate_text_with_context(tagged_text, context, ollama_url=OLLAMA_URL, model_context=MODEL_CONTEXT, source_language=LANGUAGE_SOURCE, target_language=LANGUAGE_TARGET):
+def generate_page_context(raw_page_text, global_context, ollama_url=OLLAMA_URL, model_context=MODEL_CONTEXT, source_language=LANGUAGE_SOURCE, target_language=LANGUAGE_TARGET):
+    """Generate a concise AI summary of a page's content to guide translation."""
+    if not raw_page_text.strip():
+        return None
+    url = build_ollama_endpoint(ollama_url, "/api/generate")
+    prompt = (
+        f"The following text is extracted from a single page of a document. "
+        f"The overall document context is: {global_context}\n\n"
+        f"Analyze this page's content and produce a very short summary (1-2 sentences) describing:\n"
+        f"1. The specific topic or subject of this page.\n"
+        f"2. Any key terminology, technical terms, or domain-specific vocabulary used, "
+        f"that a translator should preserve or handle carefully.\n"
+        f"Be concise and factual. Do NOT translate anything.\n\n"
+        f"Page text:\n{raw_page_text}"
+    )
+    payload = {
+        "model": model_context,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.3}
+    }
+    try:
+        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        return response.json().get("response", "").strip() or None
+    except Exception as e:
+        print(f"      Warning: page context generation failed: {e}")
+        return None
+
+def translate_text_with_context(tagged_text, context, page_context=None, ollama_url=OLLAMA_URL, model_context=MODEL_CONTEXT, source_language=LANGUAGE_SOURCE, target_language=LANGUAGE_TARGET):
     """Translates the text generically while filtering out AI conversational preambles."""
     # Anti-hallucination security: avoid calling the API if the text has no letters
     if not re.search(r'[a-zA-Z]', tagged_text):
         return tagged_text
 
     url = build_ollama_endpoint(ollama_url, "/api/generate")
-    
+    page_ctx_section = f'\n    Current page context (for reference only — do not translate this section): "{page_context}"\n' if page_context else ""
     # Restructured prompt to "force" direct translation start
     prompt = f"""You are an expert translator.
-    Global context of the document: "{context}"
+    Global context of the document: "{context}"{page_ctx_section}
 
     ABSOLUTE AND IMPERATIVE RULES:
-    1. Translate the ENTIRE text FROM {source_language} into {target_language}. Leave absolutely NO word, part of a sentence, or start of a sentence in {source_language}. EVERYTHING must be translated.
-    2. NEVER SPECIFY that the text is a "Direct {target_language} translation" or a "Literal {target_language} translation" if the text is very generic or lacks specific context.
-    3. NEVER add comments or preambles for text that is too small or empty to be translated. Just translate it as is or leave it empty.
-    4. Pay close attention to quotes (" or '): you must translate everything before, inside, and after the quotes.
-    5. Keep EXACTLY the position of HTML tags (<...>) without translating their code.
-    6. NEVER copy the source text in {source_language} into your response.
-    7. FORMAL PROHIBITION to add introductory or polite words.    
+    1. Translate ONLY the "Original text" section below, FROM {source_language} into {target_language}. Leave absolutely NO word, part of a sentence, or start of a sentence in {source_language}. EVERYTHING in the original text must be translated.
+    2. Do NOT translate the context sections above — they are background reference only.
+    3. NEVER SPECIFY that the text is a "Direct {target_language} translation" or a "Literal {target_language} translation" if the text is very generic or lacks specific context.
+    4. NEVER add comments or preambles for text that is too small or empty to be translated. Just translate it as is or leave it empty.
+    5. Pay close attention to quotes (" or '): you must translate everything before, inside, and after the quotes.
+    6. Keep EXACTLY the position of HTML tags (<...>) without translating their code.
+    7. NEVER copy the source text in {source_language} into your response.
+    8. FORMAL PROHIBITION to add introductory or polite words.
 
     Original text:
     {tagged_text}
@@ -141,7 +172,8 @@ def translate_text_with_context(tagged_text, context, ollama_url=OLLAMA_URL, mod
             r"^(Here is|Here's) the translated text(.*?):\s*",
             r"^Translation(.*?):\s*",
             r"^(Sure|Of course)(.*?):\s*",
-            r"^I am sorry(.*?)\n"
+            r"^I am sorry(.*?)\n",
+            r"\n*Direct\s+\S+\s+translation\s*[:\]]*.*",
         ]
         
         for pattern in patterns_to_remove:
@@ -497,13 +529,25 @@ def count_translatable_items_in_story_part(story_part):
     return count
 
 
-def translate_paragraph_if_needed(paragraph, context, ollama_url, model_context, source_language, target_language, progress=None):
+def translate_paragraph_if_needed(paragraph, context, ollama_url, model_context, source_language, target_language, progress=None, page_context_map=None):
     """Translate one paragraph when text content requires translation."""
     tagged_text = paragraph_to_tags(paragraph)
     if is_translatable_text(tagged_text):
+        page_context = page_context_map.get(id(paragraph._p)) if page_context_map else None
+        # Remove the current paragraph's own text from page context so the model
+        # does not confuse surrounding context with the fragment to translate
+        if page_context:
+            para_text = paragraph.text.strip()
+            if para_text:
+                filtered = '\n'.join(
+                    ln for ln in page_context.splitlines()
+                    if ln.strip() != para_text
+                )
+                page_context = filtered or None
         translation = translate_text_with_context(
             tagged_text,
             context,
+            page_context=page_context,
             ollama_url=ollama_url,
             model_context=model_context,
             source_language=source_language,
@@ -514,7 +558,7 @@ def translate_paragraph_if_needed(paragraph, context, ollama_url, model_context,
             progress.advance()
 
 
-def translate_table(table, context, ollama_url, model_context, source_language, target_language, progress=None):
+def translate_table(table, context, ollama_url, model_context, source_language, target_language, progress=None, page_context_map=None):
     """Translate a table recursively, including nested tables."""
     for row in table.rows:
         for cell in row.cells:
@@ -527,6 +571,7 @@ def translate_table(table, context, ollama_url, model_context, source_language, 
                     source_language,
                     target_language,
                     progress=progress,
+                    page_context_map=page_context_map,
                 )
             for nested_table in cell.tables:
                 translate_table(
@@ -537,10 +582,11 @@ def translate_table(table, context, ollama_url, model_context, source_language, 
                     source_language,
                     target_language,
                     progress=progress,
+                    page_context_map=page_context_map,
                 )
 
 
-def translate_story_part(story_part, context, ollama_url, model_context, source_language, target_language, progress=None):
+def translate_story_part(story_part, context, ollama_url, model_context, source_language, target_language, progress=None, page_context_map=None):
     """Translate all translatable text in a body/header/footer part."""
     for paragraph in story_part.paragraphs:
         translate_paragraph_if_needed(
@@ -551,6 +597,7 @@ def translate_story_part(story_part, context, ollama_url, model_context, source_
             source_language,
             target_language,
             progress=progress,
+            page_context_map=page_context_map,
         )
 
     for table in story_part.tables:
@@ -562,6 +609,7 @@ def translate_story_part(story_part, context, ollama_url, model_context, source_
             source_language,
             target_language,
             progress=progress,
+            page_context_map=page_context_map,
         )
 
     for txbx in story_part._element.xpath('.//w:txbxContent'):
@@ -575,6 +623,7 @@ def translate_story_part(story_part, context, ollama_url, model_context, source_
                 source_language,
                 target_language,
                 progress=progress,
+                page_context_map=page_context_map,
             )
 
 # ---------------------------------------------------------------------------
@@ -595,6 +644,64 @@ def extract_all_text(input_path):
             
     # Returns the first 8000 characters to give a general idea without crashing the API
     return "\n".join(texts)[:8000]
+
+
+def _has_explicit_page_break(p_element):
+    """Return True if a paragraph XML element contains an explicit page break."""
+    ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    for br in p_element.iter(f'{{{ns}}}br'):
+        if br.get(f'{{{ns}}}type') == 'page':
+            return True
+    return False
+
+
+def build_page_context_map(doc):
+    """
+    Walk all body block elements and return a dict mapping id(p_element) to the
+    text of the page segment the paragraph belongs to.
+    A new segment starts each time an explicit page break is encountered.
+    Table-cell and inline text-box paragraphs are assigned to the segment that
+    was active when their parent block was reached.
+    """
+    ns = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+    segments = []        # list of {"text": str, "ids": [int]}
+    current_ids = []
+    current_texts = []
+
+    def flush():
+        if current_ids:
+            segments.append({"text": '\n'.join(current_texts), "ids": list(current_ids)})
+        current_ids.clear()
+        current_texts.clear()
+
+    def register_p(p_el):
+        text = ''.join(t.text or '' for t in p_el.iter(f'{{{ns}}}t')).strip()
+        current_ids.append(id(p_el))
+        if text:
+            current_texts.append(text)
+
+    for block in doc.element.body:
+        local = block.tag.split('}')[-1] if '}' in block.tag else block.tag
+
+        if local == 'p':
+            if _has_explicit_page_break(block):
+                flush()
+            register_p(block)
+            for txbx in block.findall(f'.//{{{ns}}}txbxContent'):
+                for inner_p in txbx.findall(f'.//{{{ns}}}p'):
+                    register_p(inner_p)
+
+        elif local == 'tbl':
+            for inner_p in block.findall(f'.//{{{ns}}}p'):
+                register_p(inner_p)
+
+    flush()
+
+    context_map = {}
+    for seg in segments:
+        for p_id in seg["ids"]:
+            context_map[p_id] = seg["text"]
+    return context_map, segments
 
 def translate_full_docx(input_path, output_path, ollama_url, model_context, source_language, target_language):
     if not os.path.isfile(input_path):
@@ -645,8 +752,24 @@ def translate_full_docx(input_path, output_path, ollama_url, model_context, sour
         progress.render()
     else:
         print("   No translatable items found. The document will be saved unchanged.")
-    
-    print("\n4. Translating body content...")
+
+    print(f"\n4. Generating page contexts with AI model ({model_context})...")
+    raw_page_context_map, page_segments = build_page_context_map(doc)
+    ai_page_context_map = {}
+    for page_idx, seg in enumerate(page_segments, 1):
+        if not seg["text"].strip():
+            continue
+        page_ctx = generate_page_context(
+            seg["text"], context,
+            ollama_url=ollama_url, model_context=model_context,
+            source_language=source_language, target_language=target_language,
+        )
+        if page_ctx:
+            print(f"   -> [Page {page_idx} context] : {page_ctx}")
+        for p_id in seg["ids"]:
+            ai_page_context_map[p_id] = page_ctx
+
+    print("\n5. Translating body content...")
     translate_story_part(
         doc,
         context,
@@ -655,9 +778,10 @@ def translate_full_docx(input_path, output_path, ollama_url, model_context, sour
         source_language,
         target_language,
         progress=progress,
+        page_context_map=ai_page_context_map,
     )
 
-    print("5. Translating headers and footers...")
+    print("6. Translating headers and footers...")
     for story_part in iter_header_footer_parts(doc):
         translate_story_part(
             story_part,
@@ -671,7 +795,7 @@ def translate_full_docx(input_path, output_path, ollama_url, model_context, sour
 
     progress.finish()
 
-    print("6. Saving the translated document...")
+    print("7. Saving the translated document...")
     try:
         doc.save(output_path)
     except PermissionError as e:
@@ -685,11 +809,39 @@ def translate_full_docx(input_path, output_path, ollama_url, model_context, sour
 
     print(f"Translation complete! File saved as: {output_path}")
 
-    print("7. Unloading the model from memory...")
+    print("8. Unloading the model from memory...")
     free_ollama_memory(ollama_url=ollama_url, model=model_context)
     return True
 
 if __name__ == "__main__":
-    success = translate_full_docx(INPUT_DOCX_PATH, OUTPUT_DOCX_PATH, OLLAMA_URL, MODEL_CONTEXT, LANGUAGE_SOURCE, LANGUAGE_TARGET)
+    parser = argparse.ArgumentParser(
+        description="Translate a Word document using a local Ollama model."
+    )
+    parser.add_argument("--input", default=INPUT_DOCX_PATH, metavar="FILE",
+                        help=f"Input .docx file (default: {INPUT_DOCX_PATH})")
+    parser.add_argument("--output", default=OUTPUT_DOCX_PATH, metavar="FILE",
+                        help=f"Output .docx file (default: {OUTPUT_DOCX_PATH})")
+    parser.add_argument("--ollama-url", default=OLLAMA_URL, metavar="URL",
+                        help=f"Ollama base URL (default: {OLLAMA_URL})")
+    parser.add_argument("--model", default=MODEL_CONTEXT, metavar="NAME",
+                        help=f"Ollama model name (default: {MODEL_CONTEXT})")
+    parser.add_argument("--source-lang", default=LANGUAGE_SOURCE, metavar="LANG",
+                        help=f"Source language (default: {LANGUAGE_SOURCE})")
+    parser.add_argument("--target-lang", default=LANGUAGE_TARGET, metavar="LANG",
+                        help=f"Target language (default: {LANGUAGE_TARGET})")
+    parser.add_argument("--timeout", type=int, default=REQUEST_TIMEOUT_SECONDS, metavar="SECONDS",
+                        help=f"Request timeout in seconds (default: {REQUEST_TIMEOUT_SECONDS})")
+    args = parser.parse_args()
+    INPUT_DOCX_PATH = args.input
+    OUTPUT_DOCX_PATH = args.output
+    OLLAMA_URL = args.ollama_url
+    MODEL_CONTEXT = args.model
+    LANGUAGE_SOURCE = args.source_lang
+    LANGUAGE_TARGET = args.target_lang
+    REQUEST_TIMEOUT_SECONDS = args.timeout
+    success = translate_full_docx(
+        INPUT_DOCX_PATH, OUTPUT_DOCX_PATH, OLLAMA_URL, MODEL_CONTEXT,
+        LANGUAGE_SOURCE, LANGUAGE_TARGET,
+    )
     if not success:
         print("Translation aborted due to one or more errors.")

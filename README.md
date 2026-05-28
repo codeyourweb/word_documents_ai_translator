@@ -13,23 +13,21 @@ This script focuses on:
 - Preserving document structure and styling.
 - Using a local LLM workflow (no mandatory external translation API).
 
-## Default model
-
-The default model is **`qwen2.5:7b`** (Qwen 2.5), selected as the best balance between power and lightness for this use case.
-
-You can change the model in `word_document_translator.py` by editing `MODEL_CONTEXT` constant
-
 ## Current defaults
 
-In `word_document_translator.py`, default values are:
+Default values (all overridable via CLI arguments):
 
-- Source language: `english`
-- Target language: `french`
-- Input file: `original_document.docx`
-- Output file: `translated_document.docx`
-- Ollama endpoint: `http://localhost:11434`
+| Argument | Default |
+|---|---|
+| `--source-lang` | `french` |
+| `--target-lang` | `english` |
+| `--input` | `original_document.docx` |
+| `--output` | `translated_document.docx` |
+| `--ollama-url` | `http://localhost:11434` |
+| `--model` | `qwen2.5:7b` |
+| `--timeout` | `120` (seconds) |
 
-Replace the variables with your desired values in the script. Source and target language support depends only on the AI model used. 
+Source and target language support depends only on the AI model used.
 
 ## Requirements
 
@@ -49,17 +47,40 @@ Pull default model (if not already available):
 ollama pull qwen2.5:7b
 ```
 
-## Usage
+The default model is **`qwen2.5:7b`** (Qwen 2.5), selected as the best balance between power and lightness for this use case.
 
-1. Place your input document in the project root (or update `INPUT_DOCX_PATH`).
-2. Ensure Ollama is running locally.
-3. Run the translator:
+## Usage
 
 ```bash
 python word_document_translator.py
 ```
 
-If successful, the translated document will be written to `translated_document.docx` (or your configured output path).
+Or override any option via CLI arguments:
+
+```bash
+python word_document_translator.py \
+  --input my_document.docx \
+  --output translated.docx \
+  --source-lang english \
+  --target-lang spanish \
+  --model qwen2.5:7b \
+  --ollama-url http://localhost:11434 \
+  --timeout 120
+```
+
+### CLI arguments
+
+| Argument | Description | Default |
+|---|---|---|
+| `--input FILE` | Input `.pptx` file path | `original_document.docx` |
+| `--output FILE` | Output `.pptx` file path | `translated_document.docx` |
+| `--source-lang LANG` | Source language | `english` |
+| `--target-lang LANG` | Target language | `french` |
+| `--model NAME` | Ollama model name | `qwen2.5:7b` |
+| `--ollama-url URL` | Ollama base URL | `http://localhost:11434` |
+| `--timeout SECONDS` | Request timeout in seconds | `120` |
+
+On success, the translated file is saved to the output path.
 
 ## Notes and limitations
 
