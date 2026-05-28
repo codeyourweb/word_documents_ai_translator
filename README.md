@@ -72,8 +72,8 @@ python word_document_translator.py \
 
 | Argument | Description | Default |
 |---|---|---|
-| `--input FILE` | Input `.pptx` file path | `original_document.docx` |
-| `--output FILE` | Output `.pptx` file path | `translated_document.docx` |
+| `--input FILE` | Input `.docx` file path | `original_document.docx` |
+| `--output FILE` | Output `.docx` file path | `translated_document.docx` |
 | `--source-lang LANG` | Source language | `english` |
 | `--target-lang LANG` | Target language | `french` |
 | `--model NAME` | Ollama model name | `qwen2.5:7b` |
